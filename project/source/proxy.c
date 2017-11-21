@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "csapp.h"
-#include "cache.h"
 
 static const char* client_bad_request = "HTTP/1.1 400 Bad Request\r\nServer: Apache\r\nContent-Length: 140\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n<html><head></head><body><p>Bad Request</p></body></html>";
 static const char* connection_close = "Connection: close\r\n";
@@ -11,15 +10,15 @@ static const char* proxy_connection_close = "Proxy-Connection: close\r\n";
 static const char* user_agent = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
 
 typedef struct sockaddr_in sockaddr_in;
+typedef char* cache_queue;
 typedef struct thread_args { cache_queue* cache; int connfd; } thread_args;
 
-int cache_and_serve(char* buffer, int to_client_fd, int* valid_obj_size, void* cache_content, unsigned int* cache_length, unsigned int length);
-int process_non_get_request(char* buffer, rio_t rio_client, char* host_port, int* to_server_fd);
+
+int serve(char* buffer, int to_client_fd, int* valid_obj_size, void* cache_content, unsigned int* cache_length, unsigned int length);
 int parse_request(char* buffer, char* method, char* protocol, char* host_port, char* resource, char* version);
 int process_get_request(cache_queue* cache, int fd, char* buffer, char* method, char* resource, rio_t rio_client, char* host_port, int* to_server_fd, char* cache_id, void* cache_content, unsigned int* cache_length);
 int request_from_server(cache_queue* cache, int fd, int* to_server_fd, char* cache_id, void* cache_content, unsigned int* cache_length);
-int serve_client_and_cache(cache_queue* cache, int to_client_fd, int to_server_fd, char* cache_id, void* cache_content);
-int serve_client_from_cache(int to_client_fd, void* cache_content, unsigned int cache_length);
+int serve_client_extended(cache_queue* cache, int to_client_fd, int to_server_fd, char* cache_id, void* cache_content);
 int serve_client(int to_client_fd, int to_server_fd);
 void close_connection(int* to_client_fd, int* to_server_fd);
 void parse_host(char* host_port, char* remote_host, char* remote_port);
@@ -27,6 +26,7 @@ void* thread_routine(void* arg);
 
 #define READ_FROM_CACHE 1
 #define NON_GET_METHOD 2
+#define MAX_OBJECT_SIZE 102400
 
 int main(int argc, char* argv []) {
   // Initialize server. This is mostly taken directly from tiny server
@@ -58,7 +58,6 @@ int main(int argc, char* argv []) {
       exit(1);
     } else {
       // Port not in use. Attach and listen.
-      args.cache = init_cache();
       while (1) {
         clientlen = sizeof(clientaddr);
         args.connfd = Accept(listenfd, (SA*) &clientaddr, (socklen_t*) &clientlen);
@@ -91,19 +90,13 @@ void* thread_routine(void* vargp) {
     Pthread_exit(NULL);
   } else if (ret_val == READ_FROM_CACHE) {
     // Content is cached.
-    if (serve_client_from_cache(client_fd, cache_content, cache_length) == -1) {
-      close_connection(&client_fd, &server_fd);
-      Pthread_exit(NULL);
-    }
+    close_connection(&client_fd, &server_fd);
+    Pthread_exit(NULL);
   } else if (ret_val == NON_GET_METHOD) {
     // Only get methods supported.
-    if (serve_client(client_fd, server_fd) == -1) {
-      close_connection(&client_fd, &server_fd);
-      Pthread_exit(NULL);
-    }
   } else {
     // Correct branch taken. Cache output when available.
-    if (serve_client_and_cache(cache, client_fd, server_fd, cache_id, cache_content) == -1) {
+    if (serve_client_extended(cache, client_fd, server_fd, cache_id, cache_content) == -1) {
       close_connection(&client_fd, &server_fd);
       Pthread_exit(NULL);
     }
@@ -169,110 +162,19 @@ int process_get_request(
   if (strcmp(remote_host, "") == 0) {
     return -1;
   } else {
-    // Build over cached key
-    strcpy(cache_id, method);
-    strcat(cache_id, " ");
-    strcat(cache_id, remote_host);
-    strcat(cache_id, ":");
-    strcat(cache_id, remote_port);
-    strcat(cache_id, resource);
-    // Access cached element.
-    if (read_cache_element_sync(cache, cache_id, cache_content, cache_length) != -1) {
-      // Cache contains element. Differ.
-      return READ_FROM_CACHE;
-    } else {
-      // Open port and connect.
-      if ((*to_server_fd = Open_clientfd(remote_host, remote_port)) == -1) {
-        return -1;
-      } else if (*to_server_fd == -2) {
-        // Write buffer as appropriate
-        strcpy(buffer, client_bad_request);
-        Rio_writen(fd, buffer, strlen(buffer));
-        return -1;
-      } else if (Rio_writen(*to_server_fd, request_buffer, strlen(request_buffer)) == -1) {
-        // An error occurred.
-        return -1;
-      } else {
-        return 0;
-      }
-    }
-  }
-}
-
-int process_non_get_request(
-  char* buffer,
-  rio_t rio_client,
-  char* host_port,
-  int* to_server_fd
-) {
-  // Initialize local variables
-  char origin_host_header[MAXLINE];
-  char remote_host[MAXLINE];
-  char remote_port[MAXLINE];
-  char request_buffer[MAXLINE];
-  unsigned int length = 0;
-  unsigned int size = 0;
-
-  // Build request correctly.
-  strcpy(remote_host, "");
-  strcpy(remote_port, "80");
-  parse_host(host_port, remote_host, remote_port);
-  strcpy(request_buffer, buffer);
-  // Process buffer
-  while (strcmp(buffer, "\r\n") != 0 && strlen(buffer) > 0) {
-    // Use helper functions to process
-    if (Rio_readlineb(&rio_client, buffer, MAXLINE) == -1) {
+    // Open port and connect.
+    if ((*to_server_fd = Open_clientfd(remote_host, remote_port)) == -1) {
       return -1;
-    } else {
-      // Build header
-      if (strstr(buffer, "Host:") != NULL) {
-        strcpy(origin_host_header, buffer);
-        if (strlen(remote_host) < 1) {
-          sscanf(buffer, "Host: %s", host_port);
-          parse_host(host_port, remote_host, remote_port);
-        }
-      }
-      // Continue building header.
-      if (strstr(buffer, "Content-Length")) {
-        sscanf(buffer, "Content-Length: %d", &size);
-      }
-      strcat(request_buffer, buffer);
-    }
-  }
-  // Communicate
-  if (strcmp(remote_host, "") == 0) {
-    // Remove host doesn't exist.
-    return -1;
-  } else {
-    char port = atoi(remote_port);
-    // Connect to server and request.
-    if ((*to_server_fd = Open_clientfd(remote_host, &port)) < 0) {
-      // Connection failed.
+    } else if (*to_server_fd == -2) {
+      // Write buffer as appropriate
+      strcpy(buffer, client_bad_request);
+      Rio_writen(fd, buffer, strlen(buffer));
       return -1;
     } else if (Rio_writen(*to_server_fd, request_buffer, strlen(request_buffer)) == -1) {
-      // Verify wriiten.
+      // An error occurred.
       return -1;
     } else {
-      // Process paged output too large
-      while (size > MAXLINE) {
-        if ((length = Rio_readnb(&rio_client, buffer, MAXLINE)) == -1) {
-          return -1;
-        } else if (Rio_writen(*to_server_fd, buffer, length) == -1) {
-          return -1;
-        } else {
-          size -= MAXLINE;
-        }
-      }
-      // Size in correct range now,
-      if (size > 0) {
-        if ((length = Rio_readnb(&rio_client, buffer, size)) == -1) {
-          return -1;
-        } else if (Rio_writen(*to_server_fd, buffer, length) == -1) {
-          return -1;
-        }
-      }
-      // Return this to requester.
-      return NON_GET_METHOD;
+      return 0;
     }
   }
 }
@@ -312,7 +214,7 @@ int request_from_server(
         return process_get_request(cache, fd, buffer, method, resource, rio_client, host_port, to_server_fd, cache_id, cache_content, cache_length);
       } else {
         // This isn't a get request.
-        return process_non_get_request(buffer, rio_client, host_port, to_server_fd);
+        return -1;
       }
     }
   }
@@ -381,20 +283,7 @@ int serve_client(int to_client_fd, int to_server_fd) {
   }
 }
 
-int serve_client_from_cache(
-  int to_client_fd,
-  void* cache_content,
-  unsigned int cache_length
-) {
-  // Thank you helper methods.
-  if (Rio_writen(to_client_fd, cache_content, cache_length)) {
-    return -1;
-  } else {
-    return 0;
-  }
-}
-
-int cache_and_serve(
+int serve(
   char* buffer,
   int to_client_fd,
   int* valid_obj_size,
@@ -402,20 +291,6 @@ int cache_and_serve(
   unsigned int* cache_length,
   unsigned int length
 ) {
-  // Initialize local variables.
-  void* current_cache_position;
-
-  if (*valid_obj_size) {
-    // Object is valid.
-    if ((*cache_length + strlen(buffer)) > MAX_OBJECT_SIZE) {
-      *valid_obj_size = 0;
-    } else {
-      current_cache_position = (void*) ((char*) cache_content + *cache_length);
-      memcpy(current_cache_position, buffer, strlen(buffer));
-      *cache_length = *cache_length + strlen(buffer);
-      *valid_obj_size = 1;
-    }
-  }
   // Serve from buffer.
   if (Rio_writen(to_client_fd, buffer, length) == -1) {
     return -1;
@@ -424,7 +299,7 @@ int cache_and_serve(
   }
 }
 
-int serve_client_and_cache(
+int serve_client_extended(
   cache_queue* cache,
   int to_client_fd,
   int to_server_fd,
@@ -445,7 +320,7 @@ int serve_client_and_cache(
     return -1;
   } else {
     // Can we cache and server normally?
-    if(cache_and_serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, strlen(buffer)) == -1) {
+    if(serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, strlen(buffer)) == -1) {
       return -1;
     } else {
       // Process buffer.
@@ -457,7 +332,7 @@ int serve_client_and_cache(
           if (strstr(buffer, "Content-Length")) {
             sscanf(buffer, "Content-Length: %d", &size);
           }
-          if(cache_and_serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, strlen(buffer)) == -1) {
+          if(serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, strlen(buffer)) == -1) {
             return -1;
           }
         }
@@ -468,7 +343,7 @@ int serve_client_and_cache(
           if ((length = Rio_readnb(&rio_server, buffer, MAXLINE)) == -1) {
             return -1;
           } else {
-            if(cache_and_serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, length) == -1) {
+            if(serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, length) == -1) {
               return -1;
             } else {
               size -= MAXLINE;
@@ -479,24 +354,20 @@ int serve_client_and_cache(
           // Process with normal service.
           if ((length = Rio_readnb(&rio_server, buffer, size)) == -1) {
             return -1;
-          } else if (cache_and_serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, length) == -1) {
+          } else if (serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, length) == -1) {
             return -1;
           }
         }
       } else {
         // Content no good.
         while ((length = Rio_readnb(&rio_server, buffer, MAXLINE)) > 0) {
-          if(cache_and_serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, length) == -1) {
+          if(serve(buffer, to_client_fd, &valid_obj_size, cache_content, &cache_length, length) == -1) {
             return -1;
           }
         }
       }
       // Syncronously add data to cache.
-      if (valid_obj_size && (add_data_to_cache_sync(cache, cache_id, cache_content, cache_length) == -1)) {
-        return -1;
-      } else {
-        return 0;
-      }
+      return 0;
     }
   }
 }
