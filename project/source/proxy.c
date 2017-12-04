@@ -231,76 +231,7 @@ int process_non_get_request(
   char* host_port,
   int* to_server_fd
 ) {
-  // Initialize local variables
-  char origin_host_header[MAXLINE];
-  char remote_host[MAXLINE];
-  char remote_port[MAXLINE];
-  char request_buffer[MAXLINE];
-  unsigned int length = 0;
-  unsigned int size = 0;
-
-  // Build request correctly.
-  strcpy(remote_host, "");
-  strcpy(remote_port, "80");
-  parse_host(host_port, remote_host, remote_port);
-  strcpy(request_buffer, buffer);
-  // Process buffer
-  while (strcmp(buffer, "\r\n") != 0 && strlen(buffer) > 0) {
-    // Use helper functions to process
-    if (Rio_readlineb(&rio_client, buffer, MAXLINE) == -1) {
-      return -1;
-    } else {
-      // Build header
-      if (strstr(buffer, "Host:") != NULL) {
-        strcpy(origin_host_header, buffer);
-        if (strlen(remote_host) < 1) {
-          sscanf(buffer, "Host: %s", host_port);
-          parse_host(host_port, remote_host, remote_port);
-        }
-      }
-      // Continue building header.
-      if (strstr(buffer, "Content-Length")) {
-        sscanf(buffer, "Content-Length: %d", &size);
-      }
-      strcat(request_buffer, buffer);
-    }
-  }
-  // Communicate
-  if (strcmp(remote_host, "") == 0) {
-    // Remove host doesn't exist.
-    return -1;
-  } else {
-    char port = atoi(remote_port);
-    // Connect to server and request.
-    if ((*to_server_fd = Open_clientfd(remote_host, &port)) < 0) {
-      // Connection failed.
-      return -1;
-    } else if (Rio_writen(*to_server_fd, request_buffer, strlen(request_buffer)) == -1) {
-      // Verify wriiten.
-      return -1;
-    } else {
-      // Process paged output too large
-      while (size > MAXLINE) {
-        if ((length = Rio_readnb(&rio_client, buffer, MAXLINE)) == -1) {
-          return -1;
-        } else if (Rio_writen(*to_server_fd, buffer, length) == -1) {
-          return -1;
-        } else {
-          size -= MAXLINE;
-        }
-      }
-      // Size in correct range now,
-      if (size > 0) {
-        if ((length = Rio_readnb(&rio_client, buffer, size)) == -1) {
-          return -1;
-        } else if (Rio_writen(*to_server_fd, buffer, length) == -1) {
-          return -1;
-        }
-      }
-      // Return this to requester.
-      return NON_GET_METHOD;
-    }
-  }
+  return -1;
 }
 
 int request_from_server(
